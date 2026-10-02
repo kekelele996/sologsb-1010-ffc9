@@ -44,7 +44,7 @@ const commonRules: TranscriptionRule[] = [
   ...punctuation,
 ];
 
-const ruleSets: RuleSet[] = [
+export const ruleSets: RuleSet[] = [
   {
     id: 'ueb-teaching',
     name: 'UEB 教学规则',
@@ -75,6 +75,7 @@ const base: ProjectState = {
   id: 'braille-course-1010',
   title: '春天观察课 · 盲文教材',
   author: '资源教师 / 林老师',
+  attribution: null,
   activeRuleSetId: 'ueb-teaching',
   ruleSets,
   selectedLineId: 'line-1',
@@ -89,6 +90,12 @@ const base: ProjectState = {
   ],
   issues: [],
   versions: [],
+  standardsLibraryId: 'official-braille-norms',
+  standardsLibraryVersion: 'v1',
+  syncStatus: 'idle',
+  syncMessage: '',
+  lastSyncedAt: null,
+  reconciliation: null,
   lastCheckedAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
 };

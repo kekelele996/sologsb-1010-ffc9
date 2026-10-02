@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
-import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
+import { analyzeProject, brailleCellCount, buildReconciliation, clearReconciliation, decideReconciliationItem, makeRule, outputText, pendingReconciliationCount, updateRuleInSet } from './braille';
 import { createInitialProject } from './sample';
-import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
+import { fetchStandardsLibrary } from './standards';
+import type { Attribution, HistoryState, ProofIssue, ProjectState, Reconciliation, TextbookLine, VersionSnapshot } from './types';
 
 const STORAGE_KEY = 'sologsb-1010-braille-project-v1';
 const HISTORY_LIMIT = 60;
@@ -50,12 +51,31 @@ function historyReducer(state: HistoryState, action: HistoryAction): HistoryStat
   };
 }
 
+function migrateState(parsed: Partial<ProjectState>): ProjectState {
+  const fallback = createInitialProject();
+  return {
+    ...fallback,
+    ...parsed,
+    attribution: parsed.attribution ?? null,
+    ruleSets: parsed.ruleSets?.length ? parsed.ruleSets : fallback.ruleSets,
+    lines: parsed.lines?.length ? parsed.lines : fallback.lines,
+    issues: parsed.issues ?? [],
+    versions: parsed.versions ?? [],
+    standardsLibraryId: parsed.standardsLibraryId ?? fallback.standardsLibraryId,
+    standardsLibraryVersion: parsed.standardsLibraryVersion ?? 'v1',
+    syncStatus: parsed.syncStatus === 'syncing' ? 'idle' : (parsed.syncStatus ?? 'idle'),
+    syncMessage: parsed.syncMessage ?? '',
+    lastSyncedAt: parsed.lastSyncedAt ?? null,
+    reconciliation: parsed.reconciliation ?? null,
+  };
+}
+
 function loadInitialState(): ProjectState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
-      const parsed = JSON.parse(raw) as ProjectState;
-      return analyzeProject(parsed);
+      const parsed = JSON.parse(raw) as Partial<ProjectState>;
+      return analyzeProject(migrateState(parsed));
     }
   } catch {
     // 清除损坏草稿并使用内置示例。
@@ -292,6 +312,7 @@ function LineCard({
 
 function EditorPanel({
   state,
+  banner,
   onSelectLine,
   onChangeLine,
   onNote,
@@ -300,8 +321,10 @@ function EditorPanel({
   onAddLine,
   onSplitLongLines,
   onImport,
+  onEditAttribution,
 }: {
   state: ProjectState;
+  banner?: ComponentChildren;
   onSelectLine: (id: string) => void;
   onChangeLine: (id: string, source: string) => void;
   onNote: (id: string, note: string) => void;
@@ -310,6 +333,7 @@ function EditorPanel({
   onAddLine: () => void;
   onSplitLongLines: () => void;
   onImport: (text: string) => void;
+  onEditAttribution: () => void;
 }) {
   const [showImport, setShowImport] = useState(false);
   const [importText, setImportText] = useState('');
@@ -320,7 +344,14 @@ function EditorPanel({
         <div>
           <span class="eyebrow">逐行校对</span>
           <h1>{state.title}</h1>
-          <p>{state.author} · {state.lines.length} 行 · {brailleCellCount(state)} 格</p>
+          <p>
+            {state.author} · {state.lines.length} 行 · {brailleCellCount(state)} 格
+            {state.attribution && (
+              <button class="attribution-chip" onClick={onEditAttribution} title="修改稿件归属">
+                {state.attribution.school} · {state.attribution.teacher}{state.attribution.group ? ` · ${state.attribution.group}` : ''}
+              </button>
+            )}
+          </p>
         </div>
         <div class="toolbar-actions">
           <md-outlined-button onClick={() => setShowImport((value) => !value)}>导入课文</md-outlined-button>
@@ -353,6 +384,8 @@ function EditorPanel({
           </div>
         </div>
       )}
+
+      {banner}
 
       <div class="line-list scroll-pane">
         {state.lines.map((line, index) => (
@@ -479,9 +512,105 @@ function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; 
   );
 }
 
+function ReconciliationPanel({
+  reconciliation,
+  onDecide,
+  onClear,
+  onJump,
+}: {
+  reconciliation: Reconciliation | null;
+  onDecide: (lineId: string, decision: 'accepted' | 'kept') => void;
+  onClear: () => void;
+  onJump: (lineId: string) => void;
+}) {
+  if (!reconciliation || reconciliation.items.length === 0) {
+    return (
+      <div class="inspector-body">
+        <div class="empty-state">
+          <span>⇄</span>
+          <strong>没有待认定的对账</strong>
+          <p>教研组规范库更新后，这里会按行号摆出新旧盲文；已批准的行需逐行认定，原文和备注不会改动。</p>
+        </div>
+      </div>
+    );
+  }
+
+  const pending = reconciliation.items.filter((item) => item.decision === 'pending').length;
+
+  return (
+    <div class="inspector-body">
+      <div class="recon-callout">
+        <div>
+          <strong>规范库 {reconciliation.libraryVersion} · {reconciliation.origin === 'sync' ? '教研组同步' : '本地规则变更'}</strong>
+          <p>{pending ? `${pending} 行待逐行认定；未批准行已按新规范重走。` : '全部行已认定完成。'}</p>
+        </div>
+        {!pending && <md-text-button onClick={onClear}>关闭对账</md-text-button>}
+      </div>
+      {reconciliation.items.map((item) => (
+        <div class={`recon-row ${item.decision !== 'pending' ? item.decision : ''} ${item.wasApproved ? 'approved' : ''}`} key={item.lineId}>
+          <div class="recon-row-head">
+            <button class="recon-line-num" onClick={() => onJump(item.lineId)}>第 {item.lineNumber} 行</button>
+            <div class="recon-tags">
+              {item.wasApproved && <span class="recon-tag approved">已批准 · 需逐行认定</span>}
+              {item.breakAffected && <span class="recon-tag">断词受影响</span>}
+              {item.hyphenAffected && <span class="recon-tag">跨行连字符受影响</span>}
+            </div>
+          </div>
+          <p class="recon-source">{item.source}</p>
+          <div class="recon-diff">
+            <div class="recon-braille old"><small>旧稿</small><span>{item.oldBraille || '（空）'}</span></div>
+            <div class="recon-arrow">→</div>
+            <div class="recon-braille new"><small>新规范</small><span>{item.newBraille}</span></div>
+          </div>
+          {item.decision === 'pending' ? (
+            <div class="recon-actions">
+              <md-filled-tonal-button onClick={() => onDecide(item.lineId, 'accepted')}>采用新盲文</md-filled-tonal-button>
+              <md-text-button onClick={() => onDecide(item.lineId, 'kept')}>保留旧盲文</md-text-button>
+            </div>
+          ) : (
+            <div class="recon-decided">{item.decision === 'accepted' ? '已采用新盲文' : '已保留旧盲文'}</div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AttributionModal({ initial, onSave, onClose }: { initial: Attribution | null; onSave: (attribution: Attribution) => void; onClose?: () => void }) {
+  const [school, setSchool] = useState(initial?.school ?? '');
+  const [teacher, setTeacher] = useState(initial?.teacher ?? '');
+  const [group, setGroup] = useState(initial?.group ?? '');
+  const canSave = school.trim().length > 0 && teacher.trim().length > 0;
+
+  return (
+    <div class="modal-scrim" role="dialog" aria-modal="true" aria-label="补全稿件归属">
+      <div class="modal-card">
+        <span class="eyebrow">{initial ? '修改归属' : '旧稿首次打开 · 先补归属'}</span>
+        <h2>这份稿子归谁使用？</h2>
+        <p>补全学校 / 教研组与教师信息后再开始校对。归属只随草稿保存在本机，不会随课文和盲文一起改动。</p>
+        <div class="stack-sm">
+          <md-outlined-text-field value={school} label="学校 / 教研组" onInput={(event: any) => setSchool(event.currentTarget.value)} />
+          <md-outlined-text-field value={teacher} label="教师" onInput={(event: any) => setTeacher(event.currentTarget.value)} />
+          <md-outlined-text-field value={group} label="班级 / 课文归属（选填）" onInput={(event: any) => setGroup(event.currentTarget.value)} />
+        </div>
+        <div class="modal-actions">
+          {onClose && <md-text-button onClick={onClose}>取消</md-text-button>}
+          <md-filled-button
+            disabled={!canSave}
+            onClick={() => onSave({ school: school.trim(), teacher: teacher.trim(), group: group.trim(), filledAt: new Date().toISOString() })}
+          >
+            保存归属并开始
+          </md-filled-button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const { state, history, commit, undo, redo, restore } = useProject();
-  const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions'>('issues');
+  const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions' | 'reconciliation'>('issues');
+  const [showAttribution, setShowAttribution] = useState(false);
   const selectedLineRef = useRef(state.selectedLineId);
   selectedLineRef.current = state.selectedLineId;
 
@@ -496,7 +625,12 @@ export default function App() {
   };
 
   const changeLine = (lineId: string, source: string) => {
-    commit('修改课文原文', (current) => analyzeProject({ ...current, lines: current.lines.map((line) => line.id === lineId ? { ...line, source } : line) }));
+    commit('修改课文原文', (current) => analyzeProject({
+      ...current,
+      lines: current.lines.map((line) => line.id === lineId
+        ? { ...line, source, status: line.status === 'approved' ? 'reviewed' : line.status }
+        : line),
+    }));
   };
 
   const changeStatus = (lineId: string, status: TextbookLine['status']) => {
@@ -583,19 +717,38 @@ export default function App() {
     printWindow.document.close();
   };
 
+  /** 规则变更后重走：未批准行直接更新，已批准行进入对账逐行认定。 */
+  const commitRuleSetsChange = (label: string, mutate: (current: ProjectState) => ProjectState) => {
+    commit(label, (current) => {
+      const next = mutate(current);
+      const { lines, issues, reconciliation } = buildReconciliation(current, next.ruleSets, {
+        origin: 'rules-changed',
+        libraryId: current.standardsLibraryId,
+        libraryVersion: current.standardsLibraryVersion,
+      });
+      return {
+        ...next,
+        lines,
+        issues,
+        reconciliation: reconciliation ?? (current.reconciliation?.status === 'pending' ? current.reconciliation : null),
+        updatedAt: new Date().toISOString(),
+      };
+    });
+  };
+
   const updateRule = (ruleId: string, patch: Record<string, unknown>) => {
-    commit('修改转录规则', (current) => {
+    commitRuleSetsChange('修改转录规则', (current) => {
       const ruleSet = current.ruleSets.find((set) => set.id === current.activeRuleSetId) ?? current.ruleSets[0];
       const nextSet = updateRuleInSet(ruleSet, ruleId, patch);
-      return analyzeProject({ ...current, ruleSets: current.ruleSets.map((set) => set.id === nextSet.id ? nextSet : set) });
+      return { ...current, ruleSets: current.ruleSets.map((set) => set.id === nextSet.id ? nextSet : set) };
     });
   };
 
   const batchFixRule = (ruleId: string) => {
-    commit('批量修正同类问题', (current) => {
+    commitRuleSetsChange('批量修正同类问题', (current) => {
       const ruleSet = current.ruleSets.find((set) => set.id === current.activeRuleSetId) ?? current.ruleSets[0];
       const nextSet = updateRuleInSet(ruleSet, ruleId, { enabled: false });
-      return analyzeProject({ ...current, ruleSets: current.ruleSets.map((set) => set.id === nextSet.id ? nextSet : set) });
+      return { ...current, ruleSets: current.ruleSets.map((set) => set.id === nextSet.id ? nextSet : set) };
     });
   };
 
@@ -613,6 +766,79 @@ export default function App() {
     }));
   };
 
+  const applyLibrary = (library: Awaited<ReturnType<typeof fetchStandardsLibrary>>, label: string) => {
+    commit(label, (current) => {
+      const versionChanged = library.version !== current.standardsLibraryVersion;
+      const { lines, issues, reconciliation } = buildReconciliation(current, library.ruleSets, {
+        origin: 'sync',
+        libraryId: library.id,
+        libraryVersion: library.version,
+      });
+      const pending = reconciliation?.items.filter((item) => item.decision === 'pending').length ?? 0;
+      return {
+        ...current,
+        ruleSets: library.ruleSets,
+        lines,
+        issues,
+        standardsLibraryId: library.id,
+        standardsLibraryVersion: library.version,
+        syncStatus: 'success',
+        syncMessage: versionChanged
+          ? `规范库已更新到 ${library.version}${pending ? `；${pending} 行已经您批准，需逐行认定` : ''}`
+          : '规范库已是最新，稿子无需重走。',
+        lastSyncedAt: new Date().toISOString(),
+        reconciliation: reconciliation ?? (current.reconciliation?.status === 'pending' ? current.reconciliation : null),
+        updatedAt: new Date().toISOString(),
+      };
+    });
+  };
+
+  const syncLibrary = async () => {
+    commit('开始同步规范库', (current) => ({ ...current, syncStatus: 'syncing', syncMessage: '正在取回教研组规范库…' }));
+    try {
+      const library = await fetchStandardsLibrary();
+      applyLibrary(library, '同步教研组规范库');
+      setInspectorTab('reconciliation');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '规范库同步失败。';
+      commit('规范库同步失败', (current) => ({ ...current, syncStatus: 'failed', syncMessage: message }));
+    }
+  };
+
+  const retrySync = async () => {
+    commit('按这侧重试同步', (current) => ({ ...current, syncStatus: 'syncing', syncMessage: '正在按学校这份稿子重试…' }));
+    try {
+      const library = await fetchStandardsLibrary();
+      applyLibrary(library, '同步教研组规范库');
+      setInspectorTab('reconciliation');
+    } catch (error) {
+      // 规范库仍未取回：按这侧重试，只用本地规则重走，只补没对上的行。
+      const message = error instanceof Error ? error.message : '规范库同步失败。';
+      commit('按本地重试对账', (current) => {
+        const { lines, issues, reconciliation } = buildReconciliation(current, current.ruleSets, {
+          origin: 'rules-changed',
+          libraryId: current.standardsLibraryId,
+          libraryVersion: current.standardsLibraryVersion,
+        });
+        return {
+          ...current,
+          lines,
+          issues,
+          syncStatus: 'failed',
+          syncMessage: `${message} 已按本地规则重走，只补没对上的行；稿子可继续修改。`,
+          reconciliation: reconciliation ?? current.reconciliation,
+          updatedAt: new Date().toISOString(),
+        };
+      });
+      setInspectorTab('reconciliation');
+    }
+  };
+
+  const saveAttribution = (attribution: Attribution) => {
+    commit('补全稿件归属', (current) => ({ ...current, attribution, updatedAt: new Date().toISOString() }));
+    setShowAttribution(false);
+  };
+
   return (
     <div class="app-shell">
       <header class="topbar">
@@ -626,12 +852,25 @@ export default function App() {
           <small>上次自动保存 {formatTime(state.updatedAt)}</small>
         </div>
         <div class="topbar-actions">
+          <md-outlined-button onClick={syncLibrary} disabled={state.syncStatus === 'syncing'}>
+            {state.syncStatus === 'syncing' ? '正在取回规范库…' : '同步规范库'}
+          </md-outlined-button>
           <md-icon-button onClick={undo} disabled={history.past.length === 0} aria-label="撤销" title="撤销 ⌘Z">↶</md-icon-button>
           <md-icon-button onClick={redo} disabled={history.future.length === 0} aria-label="重做" title="重做 ⇧⌘Z">↷</md-icon-button>
           <md-outlined-button onClick={exportText}>导出文本</md-outlined-button>
           <md-filled-button onClick={exportPrint}>打印版导出</md-filled-button>
         </div>
       </header>
+
+      {state.syncStatus === 'failed' && (
+        <div class="sync-banner" role="alert">
+          <div>
+            <strong>规范库未取回，学校这份稿子仍可照常修改。</strong>
+            <span>{state.syncMessage}</span>
+          </div>
+          <md-filled-tonal-button onClick={retrySync}>按这侧重试（只补没对上的）</md-filled-tonal-button>
+        </div>
+      )}
 
       <div class="status-ribbon">
         <div class="progress-block">
@@ -664,6 +903,15 @@ export default function App() {
 
         <EditorPanel
           state={state}
+          banner={pendingReconciliationCount(state) > 0 ? (
+            <div class="recon-banner" role="alert">
+              <div>
+                <strong>教研组新规范重走后，有 {pendingReconciliationCount(state)} 行已经您批准、不能悄悄变样。</strong>
+                <span>请逐行认定保留旧盲文或采用新盲文；原文和校对备注不会被改动。</span>
+              </div>
+              <md-filled-tonal-button onClick={() => setInspectorTab('reconciliation')}>打开对账（按行号）</md-filled-tonal-button>
+            </div>
+          ) : null}
           onSelectLine={selectLine}
           onChangeLine={changeLine}
           onNote={(lineId, note) => commit('添加校对备注', (current) => ({ ...current, lines: current.lines.map((line) => line.id === lineId ? { ...line, note } : line) }))}
@@ -680,16 +928,18 @@ export default function App() {
             const lines = current.lines.flatMap((line) => line.source
               .split(/(?<=[.!?。！？])\s+|;\s*/)
               .filter((part) => part.trim())
-              .map((source, index) => ({ ...line, id: index === 0 ? line.id : `line-split-${Date.now()}-${index}`, source: source.trim(), tokens: [], note: index === 0 ? line.note : '' })));
+              .map((source, index) => ({ ...line, id: index === 0 ? line.id : `line-split-${Date.now()}-${index}`, source: source.trim(), tokens: [], status: 'unchecked' as const, note: index === 0 ? line.note : '' })));
             return analyzeProject({ ...current, lines });
           })}
           onImport={importCourse}
+          onEditAttribution={() => setShowAttribution(true)}
         />
 
         <aside class="right-panel">
           <div class="inspector-tabs" role="tablist">
             <button class={inspectorTab === 'issues' ? 'active' : ''} onClick={() => setInspectorTab('issues')}>问题 {unresolvedCount > 0 && <span>{unresolvedCount}</span>}</button>
             <button class={inspectorTab === 'rules' ? 'active' : ''} onClick={() => setInspectorTab('rules')}>规则详情</button>
+            <button class={inspectorTab === 'reconciliation' ? 'active' : ''} onClick={() => setInspectorTab('reconciliation')}>对账 {pendingReconciliationCount(state) > 0 && <span>{pendingReconciliationCount(state)}</span>}</button>
             <button class={inspectorTab === 'versions' ? 'active' : ''} onClick={() => setInspectorTab('versions')}>版本 {state.versions.length > 0 && <span>{state.versions.length}</span>}</button>
           </div>
           {inspectorTab === 'issues' && (
@@ -707,12 +957,28 @@ export default function App() {
               ruleSets: current.ruleSets.map((set) => set.id === current.activeRuleSetId ? { ...set, rules: set.rules.filter((rule) => rule.id !== ruleId) } : set),
             }));
           }} />}
+          {inspectorTab === 'reconciliation' && (
+            <ReconciliationPanel
+              reconciliation={state.reconciliation}
+              onDecide={(lineId, decision) => commit('逐行认定对账', (current) => decideReconciliationItem(current, lineId, decision))}
+              onClear={() => commit('关闭对账', clearReconciliation)}
+              onJump={(lineId) => selectLine(lineId, true)}
+            />
+          )}
           {inspectorTab === 'versions' && <VersionsPanel state={state} onSnapshot={() => recordVersion()} onRestore={(version) => {
             const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions });
             restore(restored);
           }} />}
         </aside>
       </div>
+
+      {(!state.attribution || showAttribution) && (
+        <AttributionModal
+          initial={state.attribution}
+          onSave={saveAttribution}
+          onClose={state.attribution ? () => setShowAttribution(false) : undefined}
+        />
+      )}
     </div>
   );
 }
