@@ -1,3 +1,4 @@
+import { buildSpecV1, findRuleSet, findSpec, SPEC_V1_ID, uid } from './library';
 import type {
   BrailleToken,
   ProofIssue,
@@ -6,6 +7,8 @@ import type {
   TextbookLine,
   TranscriptionRule,
 } from './types';
+
+export { uid, makeRule };
 
 const LETTERS: Record<string, string> = {
   a: '⠁', b: '⠃', c: '⠉', d: '⠙', e: '⠑', f: '⠋', g: '⠛', h: '⠓', i: '⠊', j: '⠚',
@@ -21,8 +24,6 @@ const DEFAULT_PUNCTUATION: Record<string, string> = {
 const DIGITS: Record<string, string> = {
   '0': '⠚', '1': '⠁', '2': '⠃', '3': '⠉', '4': '⠙', '5': '⠑', '6': '⠋', '7': '⠛', '8': '⠓', '9': '⠊',
 };
-
-const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
 function activeRule(ruleSet: RuleSet, source: string, kind: TranscriptionRule['kind']): TranscriptionRule | undefined {
   return ruleSet.rules.find((rule) => rule.enabled && rule.kind === kind && rule.source.toLocaleLowerCase() === source.toLocaleLowerCase());
@@ -128,7 +129,7 @@ export function transcribeLine(source: string, ruleSet: RuleSet, continuesPrevio
     addToken(tokens, '', ruleSet.hyphenMode === 'cross-line' ? '⠤↳' : '⠤', 'special', Math.max(0, source.length - 1));
   }
 
-  if (continuesPrevious) {
+  if (continuesPrevious && ruleSet.hyphenMode === 'cross-line') {
     tokens.unshift({
       id: uid('token'),
       text: '',
@@ -142,7 +143,7 @@ export function transcribeLine(source: string, ruleSet: RuleSet, continuesPrevio
   return tokens;
 }
 
-function issue(
+function makeIssue(
   line: TextbookLine,
   code: string,
   message: string,
@@ -173,46 +174,76 @@ function analyzeLine(line: TextbookLine, previousLine?: TextbookLine): { line: T
   };
 
   if (hasContinuation) {
-    issues.push(issue(nextLine, 'cross-line-hyphen', '此行以连字符结尾，已插入跨行连接标记；请核对断词位置。', 'warning', nextLine.tokens.at(-1)));
+    issues.push(makeIssue(nextLine, 'cross-line-hyphen', '此行以连字符结尾，已插入跨行连接标记；请核对断词位置。', 'warning', nextLine.tokens.at(-1)));
   }
 
   for (const token of nextLine.tokens) {
     if (token.suspicious) {
-      issues.push(issue(nextLine, 'suspicious-rule', `规则“${token.text}”被标记为可疑转写。`, 'warning', token));
+      issues.push(makeIssue(nextLine, 'suspicious-rule', `规则“${token.text}”被标记为可疑转写。`, 'warning', token));
     }
     if (token.text && token.braille.includes('⟦')) {
-      issues.push(issue(nextLine, 'unknown-symbol', `“${token.text}”没有可用的转写规则。`, 'error', token));
+      issues.push(makeIssue(nextLine, 'unknown-symbol', `“${token.text}”没有可用的转写规则。`, 'error', token));
     }
   }
 
   if (tokenText.replace(/\s/g, '').length > 42) {
-    issues.push(issue(nextLine, 'line-too-long', `盲文结果为 ${tokenText.replace(/\s/g, '').length} 格，建议重新分词。`, 'info'));
+    issues.push(makeIssue(nextLine, 'line-too-long', `盲文结果为 ${tokenText.replace(/\s/g, '').length} 格，建议重新分词。`, 'info'));
   }
 
   if (hasContinuation && nextLine.source.trimEnd().split(/\s+/).at(-1)?.replace(/-$/, '').length === 1) {
-    issues.push(issue(nextLine, 'orphan-fragment', '断词后仅剩一个字母，教学排版中通常应整体移到下一行。', 'warning'));
+    issues.push(makeIssue(nextLine, 'orphan-fragment', '断词后仅剩一个字母，教学排版中通常应整体移到下一行。', 'warning'));
   }
 
-  if (issues.some((item) => item.severity === 'error')) {
-    nextLine.status = 'questionable';
-  } else if (issues.length > 0 && nextLine.status === 'unchecked') {
-    nextLine.status = 'questionable';
+  // 已批准行不因规范重走而被悄悄降级；批准冻结以 approvedTokens 为准。
+  if (nextLine.status !== 'approved') {
+    if (issues.some((item) => item.severity === 'error')) {
+      nextLine.status = 'questionable';
+    } else if (issues.length > 0 && nextLine.status === 'unchecked') {
+      nextLine.status = 'questionable';
+    }
   }
 
   return { line: nextLine, issues };
 }
 
+/**
+ * 按每行钉住的规范版本重走转录：
+ * - 已批准且带冻结盲文的行，盲文与跨行标记保持批准时原样（规范更新只能走对账）；
+ * - 对账中“保留旧稿”的行继续按旧版本规则转写，原文与备注不动。
+ */
 export function analyzeProject(state: ProjectState): ProjectState {
-  const ruleSet = state.ruleSets.find((item) => item.id === state.activeRuleSetId) ?? state.ruleSets[0];
   const nextLines: TextbookLine[] = [];
   const issues: ProofIssue[] = [];
 
   state.lines.forEach((line, index) => {
-    const previousSourceContinues = Boolean(state.lines[index - 1]?.source.trimEnd().endsWith('-'));
-    const tokens = transcribeLine(line.source, ruleSet, previousSourceContinues);
-    const analyzed = analyzeLine({ ...line, tokens }, state.lines[index - 1]);
+    const previousLine = state.lines[index - 1];
+    const previousSourceContinues = Boolean(previousLine?.source.trimEnd().endsWith('-'));
+    const spec = findSpec(state, line.specVersionId ?? state.specAttribution.specVersionId);
+    const ruleSet = findRuleSet(spec, state.activeRuleSetId);
+
+    let working: TextbookLine;
+    if (line.status === 'approved' && line.approvedTokens && line.approvedTokens.length > 0) {
+      // 冻结批准盲文：连跨行前缀/后缀标记也保持批准时刻原样。
+      working = {
+        ...line,
+        tokens: structuredClone(line.approvedTokens),
+        specVersionId: line.specVersionId ?? spec.id,
+        continuesPrevious: line.approvedTokens.some((token) => token.braille.startsWith('↳')),
+        continuesNext: line.source.trimEnd().endsWith('-'),
+      };
+    } else {
+      const tokens = transcribeLine(line.source, ruleSet, previousSourceContinues);
+      working = { ...line, tokens, specVersionId: spec.id, approvedTokens: line.status === 'approved' ? line.approvedTokens ?? null : null };
+    }
+
+    const analyzed = analyzeLine(working, previousLine);
+    // 批准冻结行不再重新生成问题（批准时的决定不能被新规范悄悄推翻）。
+    const frozen = line.status === 'approved' && line.approvedTokens && line.approvedTokens.length > 0;
+    if (!frozen && analyzed.line.status === 'approved' && !(analyzed.line.approvedTokens?.length)) {
+      analyzed.line.approvedTokens = structuredClone(analyzed.line.tokens);
+    }
     nextLines.push(analyzed.line);
-    issues.push(...analyzed.issues);
+    if (!frozen) issues.push(...analyzed.issues);
   });
 
   return {
@@ -231,7 +262,18 @@ export function updateRuleInSet(ruleSet: RuleSet, ruleId: string, patch: Partial
   };
 }
 
-export function makeRule(source: string, output: string, suspicious: boolean, kind: TranscriptionRule['kind'] = 'contraction'): TranscriptionRule {
+/** 学校本地的规则编辑落在当前归属版本上（取回新版本不会覆盖这些本地修改）。 */
+export function updateRulesInSpec(state: ProjectState, updateSet: (ruleSet: RuleSet) => RuleSet): ProjectState {
+  const specVersionId = state.specAttribution.specVersionId;
+  return {
+    ...state,
+    specVersions: state.specVersions.map((spec) => (spec.id !== specVersionId
+      ? spec
+      : { ...spec, ruleSets: spec.ruleSets.map((set) => (set.id === state.activeRuleSetId ? updateSet(set) : set)) })),
+  };
+}
+
+function makeRule(source: string, output: string, suspicious: boolean, kind: TranscriptionRule['kind'] = 'contraction'): TranscriptionRule {
   return {
     id: uid('rule'),
     source,
@@ -249,4 +291,57 @@ export function outputText(state: ProjectState): string {
 
 export function brailleCellCount(state: ProjectState): number {
   return state.lines.reduce((total, line) => total + line.tokens.reduce((count, token) => count + token.braille.replace(/\s/g, '').length, 0), 0);
+}
+
+/**
+ * 旧稿首次打开补归属：早于规范库版本化的草稿没有 spec 字段，
+ * 统一补到 2025 现行版；已批准行用现有盲文就地冻结，原文和校对备注一律不动。
+ */
+export function migrateProject(raw: any): { state: ProjectState; migrated: boolean } {
+  const legacy = Array.isArray(raw?.ruleSets) && !Array.isArray(raw?.specVersions);
+  const specV1 = buildSpecV1();
+
+  if (!legacy) {
+    const state = raw as ProjectState;
+    return { state, migrated: false };
+  }
+
+  const legacyRuleSets = (raw.ruleSets ?? []) as RuleSet[];
+  const spec: ProjectState['specVersions'][number] = {
+    ...specV1,
+    ruleSets: legacyRuleSets.length > 0 ? legacyRuleSets : specV1.ruleSets,
+  };
+
+  const nowIso = new Date().toISOString();
+  const lines = Array.isArray(raw.lines) ? raw.lines : [];
+  const migrated: ProjectState = {
+    ...raw,
+    specVersions: [spec],
+    specAttribution: {
+      specVersionId: SPEC_V1_ID,
+      specVersionLabel: specV1.label,
+      appliedAt: nowIso,
+    },
+    reconcileItems: Array.isArray(raw.reconcileItems) ? raw.reconcileItems : [],
+    sync: raw.sync ?? {
+      endpoint: '教研组规范库（模拟）',
+      online: typeof navigator !== 'undefined' ? navigator.onLine : false,
+      fetchStatus: 'idle',
+      lastFetchedAt: null,
+      lastFetchError: null,
+      reportStatus: 'idle',
+      lastSyncedAt: null,
+      lastSyncError: null,
+    },
+    lines: lines.map((line: TextbookLine) => ({
+      ...line,
+      specVersionId: line.specVersionId ?? SPEC_V1_ID,
+      approvedTokens: line.status === 'approved'
+        ? line.approvedTokens ?? (line.tokens.length > 0 ? structuredClone(line.tokens) : null)
+        : (line.approvedTokens ?? null),
+    })),
+    updatedAt: nowIso,
+  };
+
+  return { state: migrated, migrated: true };
 }
